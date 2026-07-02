@@ -5,6 +5,7 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
   ]
 };
 
@@ -41,6 +42,12 @@ export function useWebRTC(
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        setTransferStatus('error');
+      }
+    };
+
     // sender 创建 DataChannel
     if (myRole === 'sender') {
       const dc = pc.createDataChannel('file-transfer', { ordered: true });
@@ -58,6 +65,7 @@ export function useWebRTC(
   const setupDataChannel = useCallback((dc: RTCDataChannel) => {
     dcRef.current = dc;
     dc.binaryType = 'arraybuffer';
+    dc.bufferedAmountLowThreshold = CHUNK_SIZE * 4;
 
     dc.onopen = () => {
       setDcReady(true);
@@ -134,7 +142,7 @@ export function useWebRTC(
   // 注册信号处理
   onSignal(handleSignal);
 
-  // 发送文件
+  // 发送文件 — 使用 async 等待 + 缓冲背压控制
   const sendFile = useCallback(async (file: File) => {
     const dc = dcRef.current;
     if (!dc || dc.readyState !== 'open') return;
@@ -144,40 +152,34 @@ export function useWebRTC(
     setTransferStatus('sending');
     setProgress(0);
 
-    const reader = new FileReader();
-    let offset = 0;
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    let sentChunks = 0;
 
-    const readSlice = (sliceOffset: number) => {
-      const slice = file.slice(sliceOffset, sliceOffset + CHUNK_SIZE);
-      reader.readAsArrayBuffer(slice);
-    };
+    for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
+      const slice = file.slice(offset, offset + CHUNK_SIZE);
+      const buf = await slice.arrayBuffer();
 
-    reader.onload = (e) => {
-      const buf = e.target?.result as ArrayBuffer;
-      if (dc.bufferedAmount > CHUNK_SIZE * 8) {
-        // 等待缓冲排空
-        setTimeout(() => {
-          dc.send(buf);
-          advance();
-        }, 10);
-      } else {
-        dc.send(buf);
-        advance();
+      // 背压控制：如果缓冲过多，等待 drain
+      if (dc.bufferedAmount > CHUNK_SIZE * 16) {
+        await new Promise<void>((resolve) => {
+          const check = () => {
+            if (dc.bufferedAmount < CHUNK_SIZE * 4) {
+              resolve();
+            } else {
+              setTimeout(check, 5);
+            }
+          };
+          check();
+        });
       }
-    };
 
-    const advance = () => {
-      offset += CHUNK_SIZE;
-      setProgress(Math.min(100, (offset / file.size) * 100));
-      if (offset < file.size) {
-        readSlice(offset);
-      } else {
-        setTransferStatus('done');
-        setProgress(100);
-      }
-    };
+      dc.send(buf);
+      sentChunks++;
+      setProgress(Math.min(100, (sentChunks / totalChunks) * 100));
+    }
 
-    readSlice(0);
+    setTransferStatus('done');
+    setProgress(100);
   }, []);
 
   const close = useCallback(() => {

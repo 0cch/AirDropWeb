@@ -12,6 +12,9 @@ interface SignalingMessage {
 
 export function useSignaling() {
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttempts = useRef(0);
+  const shouldConnect = useRef(true);
   const [connected, setConnected] = useState(false);
   const [token, setToken] = useState<string | null>(null);
   const [matched, setMatched] = useState(false);
@@ -24,17 +27,47 @@ export function useSignaling() {
   }>({});
 
   const connect = useCallback(() => {
+    shouldConnect.current = true;
+    reconnectAttempts.current = 0;
+    doConnect();
+  }, []);
+
+  const doConnect = useCallback(() => {
+    if (!shouldConnect.current) return;
+    if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) return;
+
+    // 开发环境：直连信令服务器端口；生产环境：同源 /ws
+    const isDev = import.meta.env.DEV;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${location.host}/ws`;
+    const wsUrl = isDev
+      ? `${proto}//${location.hostname}:8080/ws`
+      : `${proto}//${location.host}/ws`;
+
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    ws.onopen = () => setConnected(true);
+    ws.onopen = () => {
+      setConnected(true);
+      reconnectAttempts.current = 0;
+      setError(null);
+    };
+
     ws.onclose = () => {
       setConnected(false);
       setMatched(false);
+      // 自动重连（指数退避，最大 30 秒）
+      if (shouldConnect.current) {
+        const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts.current));
+        reconnectTimer.current = setTimeout(() => {
+          reconnectAttempts.current++;
+          doConnect();
+        }, delay);
+      }
     };
-    ws.onerror = () => setError('连接服务器失败');
+
+    ws.onerror = () => {
+      // onclose 会处理重连
+    };
 
     ws.onmessage = (event) => {
       const msg: SignalingMessage = JSON.parse(event.data);
@@ -101,6 +134,13 @@ export function useSignaling() {
   }, []);
 
   const reset = useCallback(() => {
+    shouldConnect.current = false;
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+    wsRef.current?.close();
+    wsRef.current = null;
     setToken(null);
     setMatched(false);
     setError(null);
@@ -109,6 +149,10 @@ export function useSignaling() {
 
   useEffect(() => {
     return () => {
+      shouldConnect.current = false;
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current);
+      }
       wsRef.current?.close();
     };
   }, []);

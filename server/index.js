@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8080;
+const HOST = process.env.HOST || '0.0.0.0';
 
 // Token -> Room 映射
 const rooms = new Map();
@@ -31,41 +32,65 @@ function cleanupRoom(token) {
   const room = rooms.get(token);
   if (!room) return;
   for (const ws of [room.sender, room.receiver]) {
-    if (ws && ws.readyState === ws.OPEN) {
-      clients.delete(ws);
-    }
+    if (ws) clients.delete(ws);
   }
   rooms.delete(token);
 }
 
+// MIME 类型映射
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.map': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
 const server = http.createServer((req, res) => {
+  // 安全：阻止路径穿越
   // 健康检查
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', rooms: rooms.size }));
     return;
   }
-  // 生产环境托管前端静态文件
+
   const distPath = path.join(__dirname, '..', 'client', 'dist');
   if (fs.existsSync(distPath)) {
-    let filePath = req.url === '/' ? '/index.html' : req.url;
-    filePath = path.join(distPath, filePath);
+    // 解析 URL，阻止路径穿越
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    let pathname = decodeURIComponent(url.pathname);
+    if (pathname === '/') pathname = '/index.html';
+
+    // 安全检查：确保路径在 distPath 内
+    const filePath = path.normalize(path.join(distPath, pathname));
+    if (!filePath.startsWith(distPath)) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
+
     const ext = path.extname(filePath);
-    const types = {
-      '.html': 'text/html', '.js': 'text/javascript',
-      '.css': 'text/css', '.json': 'application/json',
-      '.png': 'image/png', '.svg': 'image/svg+xml',
-      '.ico': 'image/x-icon', '.woff2': 'font/woff2'
-    };
     try {
       const data = fs.readFileSync(filePath);
-      res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
+      res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
       res.end(data);
     } catch {
-      // SPA fallback
+      // SPA fallback — 所有未匹配的路由返回 index.html
       try {
         const index = fs.readFileSync(path.join(distPath, 'index.html'));
-        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(index);
       } catch {
         res.writeHead(404);
@@ -78,10 +103,14 @@ const server = http.createServer((req, res) => {
   }
 });
 
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1024 * 1024 }); // 限制信令消息大小 1MB
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   clients.set(ws, null);
+
+  // 心跳检测：30 秒无响应则断开
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (message) => {
     let msg;
@@ -94,7 +123,7 @@ wss.on('connection', (ws) => {
     const { type } = msg;
 
     if (type === 'create-room') {
-      const role = msg.role; // 'sender' | 'receiver'
+      const role = msg.role;
       if (!['sender', 'receiver'].includes(role)) {
         return send(ws, 'error', { message: 'Invalid role' });
       }
@@ -133,7 +162,6 @@ wss.on('connection', (ws) => {
       if (!clientInfo) return;
       const room = rooms.get(clientInfo.token);
       if (!room) return;
-      // 转发给房间里的另一方
       const peer = clientInfo.role === 'sender' ? room.receiver : room.sender;
       if (peer && peer.readyState === peer.OPEN) {
         peer.send(JSON.stringify({ type: 'signal', data: msg.data }));
@@ -168,12 +196,24 @@ wss.on('connection', (ws) => {
   });
 });
 
+// 心跳：每 30 秒检查连接存活
+const heartbeatInterval = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = true;
+    ws.ping();
+  }
+}, 30000);
+
+wss.on('close', () => clearInterval(heartbeatInterval));
+
 function tryMatch(token) {
   const room = rooms.get(token);
   if (!room) return;
   if (room.sender && room.receiver) {
-    // 双方都在，通知配对成功
-    // sender 作为 WebRTC 的 offer 方
     send(room.sender, 'matched', { role: 'sender' });
     send(room.receiver, 'matched', { role: 'receiver' });
   }
@@ -191,6 +231,23 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-server.listen(PORT, () => {
-  console.log(`Signaling server running on port ${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Signaling server running on ${HOST}:${PORT}`);
+});
+
+// 优雅关闭
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down...');
+  server.close(() => {
+    wss.close();
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down...');
+  server.close(() => {
+    wss.close();
+    process.exit(0);
+  });
 });
