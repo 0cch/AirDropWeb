@@ -1,0 +1,18 @@
+{
+  "name": "p2p-file-transfer",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev:server": "node server/index.js",
+    "dev:client": "cd client && npx vite --port 5174",
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "build": "cd client && npx vite build",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
