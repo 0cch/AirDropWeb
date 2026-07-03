@@ -235,19 +235,17 @@ server.listen(PORT, HOST, () => {
   console.log(`Signaling server running on ${HOST}:${PORT}`);
 });
 
-// 优雅关闭
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down...');
-  server.close(() => {
-    wss.close();
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down...');
-  server.close(() => {
-    wss.close();
-    process.exit(0);
-  });
-});
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(signal + ' received, shutting down...');
+  clearInterval(heartbeatInterval);
+  for (const ws of wss.clients) { try { ws.close(1001, 'Server shutting down'); } catch {} }
+  wss.close();
+  const forceExit = setTimeout(() => { console.log('Force exiting after timeout'); process.exit(1); }, 3000);
+  forceExit.unref();
+  server.close(() => { clearTimeout(forceExit); process.exit(0); });
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
