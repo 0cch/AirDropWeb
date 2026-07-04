@@ -253,7 +253,7 @@ function TransferScreen({ myRole, dcReady, progress, transferStatus, selectedFil
               dragOver ? 'border-apple-blue bg-apple-blue/5' : 'border-gray-300 hover:border-apple-blue'
             }`}
           >
-            <input type="file" onChange={onFileSelect} className="hidden" />
+            <input type="file" onChange={onFileSelect} className="file-input-hidden" />
             <div className="text-4xl mb-3">📁</div>
             <p className="font-medium text-apple-gray-dark">点击或拖拽文件到此处</p>
             <p className="text-sm text-apple-gray-text mt-1">支持任意类型文件</p>
@@ -281,7 +281,7 @@ function TransferScreen({ myRole, dcReady, progress, transferStatus, selectedFil
             )}
             {isSender && dcReady && (
               <label className="block mt-4 cursor-pointer">
-                <input type="file" onChange={onFileSelect} className="hidden" />
+                <input type="file" onChange={onFileSelect} className="file-input-hidden" />
                 <span className="apple-btn inline-block text-sm text-apple-blue hover:underline">继续发送另一个文件</span>
               </label>
             )}
