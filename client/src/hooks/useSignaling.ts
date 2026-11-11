@@ -207,6 +207,12 @@ export function useSignaling() {
   const connect = useCallback(() => {
     shouldConnect.current = true;
     reconnectAttempts.current = 0;
+    const existing = wsRef.current;
+    if (existing?.readyState === WebSocket.CONNECTING) {
+      ignoredSockets.current.add(existing);
+      try { existing.close(); } catch {}
+      wsRef.current = null;
+    }
     doConnect();
   }, [doConnect]);
 
@@ -271,7 +277,11 @@ export function useSignaling() {
       shouldConnect.current = false;
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       clearResumeTimer();
-      wsRef.current?.close();
+      if (wsRef.current) {
+        ignoredSockets.current.add(wsRef.current);
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, [clearResumeTimer]);
 
