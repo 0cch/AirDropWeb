@@ -147,6 +147,7 @@ export function useWebRTC(
   signalingConnected: boolean
 ) {
   const pcRef = useRef<RTCPeerConnection | null>(null);
+  const peerInitPromiseRef = useRef<Promise<RTCPeerConnection> | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const iceServersPromiseRef = useRef<Promise<RTCIceServer[]> | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
@@ -309,56 +310,65 @@ export function useWebRTC(
     return iceServersPromiseRef.current;
   }, []);
 
-  const initPeer = useCallback(async () => {
-    if (pcRef.current) return pcRef.current;
-    if (typeof RTCPeerConnection === 'undefined') throw new Error('当前浏览器不支持 WebRTC');
+  const initPeer = useCallback(() => {
+    if (pcRef.current) return Promise.resolve(pcRef.current);
+    if (peerInitPromiseRef.current) return peerInitPromiseRef.current;
+    if (typeof RTCPeerConnection === 'undefined') return Promise.reject(new Error('当前浏览器不支持 WebRTC'));
 
-    const iceServers = await getIceServers();
-    const pc = new RTCPeerConnection({ iceServers });
-    pcRef.current = pc;
-    remoteDescriptionSetRef.current = false;
-    pendingCandidatesRef.current = [];
-    setConnectionRoute('unknown');
+    const promise = (async () => {
+      const iceServers = await getIceServers();
+      if (pcRef.current) return pcRef.current;
+      const pc = new RTCPeerConnection({ iceServers });
+      pcRef.current = pc;
+      remoteDescriptionSetRef.current = false;
+      pendingCandidatesRef.current = [];
+      setConnectionRoute('unknown');
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) sendSignal({ type: 'ice', candidate: event.candidate });
-    };
-    pc.onconnectionstatechange = () => {
-      if (pcRef.current !== pc) return;
-      if (pc.connectionState === 'connected') {
-        clearConnectionTimer();
-        void inspectConnectionRoute(pc);
+      pc.onicecandidate = (event) => {
+        if (event.candidate) sendSignal({ type: 'ice', candidate: event.candidate });
+      };
+      pc.onconnectionstatechange = () => {
+        if (pcRef.current !== pc) return;
+        if (pc.connectionState === 'connected') {
+          clearConnectionTimer();
+          void inspectConnectionRoute(pc);
+        }
+        if (pc.connectionState === 'failed') {
+          setConnectionRoute('failed');
+          if (batchRef.current) recoveryRef.current('WebRTC 连接失败');
+          else failureRef.current('无法建立 WebRTC 连接，可能需要 TURN 中继', false, true);
+        }
+      };
+      pc.oniceconnectionstatechange = () => {
+        if (pcRef.current !== pc) return;
+        if (pc.iceConnectionState === 'failed') {
+          setConnectionRoute('failed');
+          if (batchRef.current) recoveryRef.current('WebRTC 连接失败');
+          else failureRef.current('WebRTC 连接失败，请重试或配置 TURN', false, true);
+        }
+      };
+
+      if (myRole === 'sender') {
+        setupDataChannel(pc.createDataChannel('file-transfer', { ordered: true }));
       }
-      if (pc.connectionState === 'failed') {
-        setConnectionRoute('failed');
-        if (batchRef.current) recoveryRef.current('WebRTC 连接失败');
-        else failureRef.current('无法建立 WebRTC 连接，可能需要 TURN 中继', false, true);
-      }
-    };
-    pc.oniceconnectionstatechange = () => {
-      if (pcRef.current !== pc) return;
-      if (pc.iceConnectionState === 'failed') {
-        setConnectionRoute('failed');
-        if (batchRef.current) recoveryRef.current('WebRTC 连接失败');
-        else failureRef.current('WebRTC 连接失败，请重试或配置 TURN', false, true);
-      }
-    };
+      pc.ondatachannel = (event) => setupDataChannel(event.channel);
 
-    if (myRole === 'sender') {
-      setupDataChannel(pc.createDataChannel('file-transfer', { ordered: true }));
-    }
-    pc.ondatachannel = (event) => setupDataChannel(event.channel);
+      clearConnectionTimer();
+      connectionTimerRef.current = setTimeout(() => {
+        if (!dcRef.current || dcRef.current.readyState !== 'open') {
+          setConnectionRoute('failed');
+          if (batchRef.current) recoveryRef.current('WebRTC 连接超时');
+          else failureRef.current('WebRTC 连接超时，可能需要 TURN 中继', false, true);
+        }
+      }, CONNECTION_TIMEOUT_MS);
 
-    clearConnectionTimer();
-    connectionTimerRef.current = setTimeout(() => {
-      if (!dcRef.current || dcRef.current.readyState !== 'open') {
-        setConnectionRoute('failed');
-        if (batchRef.current) recoveryRef.current('WebRTC 连接超时');
-        else failureRef.current('WebRTC 连接超时，可能需要 TURN 中继', false, true);
-      }
-    }, CONNECTION_TIMEOUT_MS);
-
-    return pc;
+      return pc;
+    })();
+    peerInitPromiseRef.current = promise;
+    void promise.finally(() => {
+      if (peerInitPromiseRef.current === promise) peerInitPromiseRef.current = null;
+    });
+    return promise;
   }, [clearConnectionTimer, getIceServers, inspectConnectionRoute, myRole, sendSignal, setupDataChannel]);
 
   const flushPendingCandidates = useCallback(async (pc: RTCPeerConnection) => {
@@ -376,7 +386,8 @@ export function useWebRTC(
       return;
     }
     try {
-      if (data.type === 'offer' && pcRef.current) {
+      if (data.type === 'offer' && pcRef.current
+        && (pcRef.current.remoteDescription || pcRef.current.signalingState !== 'stable' || recoveringRef.current)) {
         const previousPc = pcRef.current;
         const previousDc = dcRef.current;
         pcRef.current = null;
