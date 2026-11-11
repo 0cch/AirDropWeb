@@ -33,7 +33,9 @@ async function createRoom(page: Page): Promise<string> {
 async function joinRoom(page: Page, token: string) {
   await page.goto(`/?token=${encodeURIComponent(token)}`);
   await expect(page.getByLabel('配对 Token')).toHaveValue(token);
-  await page.getByRole('button', { name: '连接对方' }).click();
+  const joinButton = page.getByRole('button', { name: '连接对方' });
+  await expect(joinButton).toBeEnabled({ timeout: 15_000 });
+  await joinButton.click();
 }
 
 async function waitForConnection(sender: Page, receiver: Page) {
