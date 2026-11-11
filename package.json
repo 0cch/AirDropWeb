@@ -2,17 +2,21 @@
   "name": "p2p-file-transfer",
   "version": "1.0.0",
   "private": true,
+  "workspaces": [
+    "client",
+    "server"
+  ],
   "scripts": {
-    "dev:server": "node server/index.js",
-    "dev:client": "cd client && npx vite --port 5174",
-    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
-    "build": "cd client && npx vite build",
-    "start": "node server/index.js"
-  },
-  "dependencies": {
-    "ws": "^8.16.0"
+    "dev:server": "npm run dev --workspace p2p-signaling-server",
+    "dev:client": "npm run dev --workspace p2p-file-transfer-client",
+    "dev": "concurrently -k -n server,client \"npm run dev:server\" \"npm run dev:client\"",
+    "build": "npm run build --workspace p2p-file-transfer-client",
+    "typecheck": "npm run typecheck --workspace p2p-file-transfer-client",
+    "test": "npm run test --workspace p2p-file-transfer-client && npm run test --workspace p2p-signaling-server",
+    "start": "npm run start --workspace p2p-signaling-server",
+    "audit:prod": "npm audit --omit=dev"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^10.0.7"
   }
 }

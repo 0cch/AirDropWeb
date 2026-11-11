@@ -7,17 +7,22 @@ set -e
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-8080}"
-HOST="${HOST:-0.0.0.0}"
-NODE_REQUIRED="18"
+HOST="${HOST:-}"
+NODE_REQUIRED="22"
 DOMAIN="${DOMAIN:-}"
 USE_NGINX="${USE_NGINX:-no}"
 USE_HTTPS="${USE_HTTPS:-no}"
+
+if [ -z "$HOST" ]; then
+  if [ "$USE_NGINX" = "yes" ]; then HOST="127.0.0.1"; else HOST="0.0.0.0"; fi
+fi
 
 echo "=========================================="
 echo "  P2P File Transfer 一键部署"
 echo "=========================================="
 echo "  应用目录: $APP_DIR"
 echo "  监听端口: $PORT"
+echo "  监听地址: $HOST"
 echo "  Nginx代理: $USE_NGINX"
 if [ -n "$DOMAIN" ]; then echo "  域名: $DOMAIN"; fi
 echo "  HTTPS: $USE_HTTPS"
@@ -47,39 +52,41 @@ if [ "$NODE_VERSION" -lt "$NODE_REQUIRED" ]; then
   exit 1
 fi
 
-# ========== 2. 安装服务器依赖 ==========
+# ========== 2. 安装 workspace 依赖 ==========
 echo ""
-echo "[2/6] 安装服务器依赖..."
-cd "$APP_DIR/server"
-npm install --production
+echo "[2/6] 安装项目依赖..."
+cd "$APP_DIR"
+npm ci
 
 # ========== 3. 安装前端依赖并构建 ==========
 echo ""
 echo "[3/6] 安装前端依赖并构建..."
-cd "$APP_DIR/client"
-npm install
+cd "$APP_DIR"
 npm run build
+npm prune --omit=dev
 
 # ========== 4. 配置防火墙 ==========
 echo ""
 echo "[4/6] 配置防火墙..."
 if command -v ufw &> /dev/null; then
-  sudo ufw allow $PORT/tcp 2>/dev/null || true
   if [ "$USE_NGINX" = "yes" ]; then
     sudo ufw allow 80/tcp 2>/dev/null || true
     sudo ufw allow 443/tcp 2>/dev/null || true
+  else
+    sudo ufw allow $PORT/tcp 2>/dev/null || true
   fi
-  echo "  [OK] ufw 已放行端口 $PORT"
+  echo "  [OK] ufw 端口规则已更新"
 elif command -v firewall-cmd &> /dev/null; then
-  sudo firewall-cmd --permanent --add-port=$PORT/tcp 2>/dev/null || true
   if [ "$USE_NGINX" = "yes" ]; then
     sudo firewall-cmd --permanent --add-service=http 2>/dev/null || true
     sudo firewall-cmd --permanent --add-service=https 2>/dev/null || true
+  else
+    sudo firewall-cmd --permanent --add-port=$PORT/tcp 2>/dev/null || true
   fi
   sudo firewall-cmd --reload 2>/dev/null || true
-  echo "  [OK] firewalld 已放行端口 $PORT"
+  echo "  [OK] firewalld 端口规则已更新"
 else
-  echo "  [SKIP] 未检测到防火墙工具，请手动放行端口 $PORT"
+  echo "  [SKIP] 未检测到防火墙工具，请手动配置所需端口"
 fi
 
 # ========== 5. Nginx Reverse Proxy (Optional) ==========
@@ -116,7 +123,13 @@ if [ "$USE_NGINX" = "yes" ]; then
 server {
     listen 80;
     server_name DOMAINPH;
-    client_max_body_size 0;
+    server_tokens off;
+    client_max_body_size 1m;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header X-Frame-Options DENY always;
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
     location / {
         proxy_pass http://127.0.0.1:PORTPH;
         proxy_http_version 1.1;
@@ -124,6 +137,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
     }
     location /ws {
         proxy_pass http://127.0.0.1:PORTPH;
@@ -151,7 +165,13 @@ NGINXEOF
 server {
     listen 80;
     server_name SERVERPH;
-    client_max_body_size 0;
+    server_tokens off;
+    client_max_body_size 1m;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    add_header X-Frame-Options DENY always;
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
     location / {
         proxy_pass http://127.0.0.1:PORTPH;
         proxy_http_version 1.1;
@@ -159,6 +179,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
     }
     location /ws {
         proxy_pass http://127.0.0.1:PORTPH;
@@ -191,6 +212,11 @@ echo ""
 echo "[6/6] Configuring systemd service..."
 
 SERVICE_FILE="/etc/systemd/system/p2p-file-transfer.service"
+RUN_USER="${SUDO_USER:-$USER}"
+if [ "$RUN_USER" = "root" ]; then
+  echo "  [WARN] 服务将使用 root 运行，建议用普通用户执行部署脚本"
+fi
+if [ "$USE_NGINX" = "yes" ]; then TRUST_PROXY_VALUE="1"; else TRUST_PROXY_VALUE="0"; fi
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
 Description=P2P File Transfer Server
@@ -198,14 +224,37 @@ After=network.target
 
 [Service]
 Type=simple
-User=$USER
+User=$RUN_USER
 WorkingDirectory=$APP_DIR/server
 Environment=PORT=$PORT
 Environment=HOST=$HOST
+Environment=NODE_ENV=production
+Environment=TRUST_PROXY=$TRUST_PROXY_VALUE
+Environment="ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}"
+Environment="TURN_URLS=${TURN_URLS:-}"
+Environment="TURN_SECRET=${TURN_SECRET:-}"
+Environment="TURN_USERNAME=${TURN_USERNAME:-}"
+Environment="TURN_CREDENTIAL=${TURN_CREDENTIAL:-}"
 ExecStart=$(which node) $APP_DIR/server/index.js
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -238,10 +287,15 @@ if systemctl is-active --quiet p2p-file-transfer; then
   echo "    restart: sudo systemctl restart p2p-file-transfer"
   echo "    stop:    sudo systemctl stop p2p-file-transfer"
   echo ""
-  echo "  WebRTC ports:"
-  echo "    TCP $PORT (signaling, opened)"
-  echo "    UDP 49152-65535 (WebRTC media, STUN negotiated)"
-  echo "    If P2P fails, check if UDP ports are blocked by firewall"
+  echo "  Network ports:"
+  if [ "$USE_NGINX" = "yes" ]; then
+    echo "    TCP 80/443 (HTTP/WSS reverse proxy, opened)"
+    echo "    TCP $PORT is bound to 127.0.0.1 for Nginx only"
+  else
+    echo "    TCP $PORT (HTTP/WSS signaling, opened)"
+  fi
+  echo "    WebRTC file data does not use a port on this server."
+  echo "    TURN relay is optional; open its UDP/TCP relay ports separately."
   echo "=========================================="
 else
   echo ""
