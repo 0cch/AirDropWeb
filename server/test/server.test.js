@@ -59,6 +59,23 @@ function rawHttpRequest(port, request) {
   });
 }
 
+function waitForMessage(ws, predicate, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      ws.off('message', onMessage);
+      reject(new Error('Timed out waiting for WebSocket message'));
+    }, timeoutMs);
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString());
+      if (!predicate(message)) return;
+      clearTimeout(timeout);
+      ws.off('message', onMessage);
+      resolve(message);
+    };
+    ws.on('message', onMessage);
+  });
+}
+
 test('signaling server survives hostile input and enforces one room per connection', async (t) => {
   const port = await findFreePort();
   const child = spawn(process.execPath, [serverEntry], {
@@ -132,5 +149,82 @@ test('signaling server survives hostile input and enforces one room per connecti
     'GET /% HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n'
   );
   assert.match(rawResponse, /^HTTP\/1\.1 400/);
+  assert.equal(child.exitCode, null, stderr);
+});
+
+test('resumes a paired room after a transient WebSocket disconnect', async (t) => {
+  const port = await findFreePort();
+  const child = spawn(process.execPath, [serverEntry], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      HOST: '127.0.0.1',
+      NODE_ENV: 'production',
+      ROOM_RESUME_GRACE_MS: '2000'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  t.after(async () => {
+    if (child.exitCode === null) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 3500);
+        child.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        child.kill();
+      });
+    }
+  });
+  await waitForServer(port, child);
+
+  const wsUrl = `ws://127.0.0.1:${port}/ws`;
+  const origin = `http://127.0.0.1:${port}`;
+  const sender = new WebSocket(wsUrl, { headers: { Origin: origin } });
+  await once(sender, 'open');
+  const createdPromise = waitForMessage(sender, (message) => message.type === 'room-created');
+  sender.send(JSON.stringify({ type: 'create-room', role: 'sender' }));
+  const created = await createdPromise;
+
+  const receiver = new WebSocket(wsUrl, { headers: { Origin: origin } });
+  await once(receiver, 'open');
+  const joinedPromise = waitForMessage(receiver, (message) => message.type === 'room-joined');
+  const matchedPromise = waitForMessage(sender, (message) => message.type === 'matched');
+  receiver.send(JSON.stringify({ type: 'join-room', role: 'receiver', token: created.token }));
+  const joined = await joinedPromise;
+  await matchedPromise;
+
+  const peerReconnectingPromise = waitForMessage(receiver, (message) => message.type === 'peer-reconnecting');
+  sender.close();
+  await peerReconnectingPromise;
+
+  const resumedSender = new WebSocket(wsUrl, { headers: { Origin: origin } });
+  await once(resumedSender, 'open');
+  const resumedPromise = waitForMessage(resumedSender, (message) => message.type === 'room-resumed');
+  const peerReconnectedPromise = waitForMessage(receiver, (message) => message.type === 'peer-reconnected');
+  resumedSender.send(JSON.stringify({
+    type: 'resume-room',
+    token: created.token,
+    role: 'sender',
+    sessionId: created.sessionId
+  }));
+  const resumed = await resumedPromise;
+  assert.equal(resumed.matched, true);
+  await peerReconnectedPromise;
+  assert.ok(joined.sessionId);
+
+  const signalPromise = waitForMessage(receiver, (message) => message.type === 'signal');
+  const offer = { type: 'offer', sdp: { type: 'offer', sdp: 'v=0\r\n' } };
+  resumedSender.send(JSON.stringify({ type: 'signal', data: offer }));
+  assert.deepEqual((await signalPromise).data, offer);
+
+  const senderClosed = once(resumedSender, 'close');
+  const receiverClosed = once(receiver, 'close');
+  resumedSender.close();
+  receiver.close();
+  await Promise.all([senderClosed, receiverClosed]);
   assert.equal(child.exitCode, null, stderr);
 });

@@ -6,6 +6,7 @@
 
 - WebRTC 端到端加密传输，优先 P2P 直连
 - 分享链接、二维码和系统分享，接收方可直接打开链接加入
+- 接收方可使用应用内摄像头扫码，失败后自动回退到手动输入
 - 多文件队列：一次确认、逐文件传输、总进度与单文件状态
 - 可选 TURN/TURNS 中继，覆盖对称 NAT、企业网络等场景
 - Chromium 浏览器支持 File System Access API 流式落盘，大文件不必全部进入内存
@@ -13,6 +14,8 @@
 - 其他浏览器自动使用内存模式，默认整批文件总大小上限 256 MB
 - 文件元信息、流控、完成 ACK、错误与取消控制消息
 - 支持暂停/继续、取消确认和单文件失败重试
+- 信令短暂断开后会在恢复窗口内重新绑定原房间
+- DataChannel 断开后自动重新协商，并从接收端最后写入位置续传
 - 显示局域网直连、公网直连或 TURN 中继等实际连接路径
 - 移动端支持屏幕常亮、分享链接和安全区域布局
 - 64 KB 分块、DataChannel 背压与接收端写入信用窗口
@@ -73,8 +76,11 @@ PORT=8080 ./deploy.sh
 ```bash
 TURN_URLS="turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp" \
 TURN_SECRET="replace-with-a-long-random-secret" \
+TURN_REQUIRED=1 \
 DOMAIN=example.com USE_NGINX=yes USE_HTTPS=yes ./deploy.sh
 ```
+
+可直接复用的 coturn Docker Compose 模板位于 `deploy/coturn/`。
 
 对应的 coturn 配置示例：
 
@@ -111,6 +117,7 @@ TURN_CREDENTIAL="strong-password" \
 | `ALLOWED_ORIGINS` | 同源 | 逗号分隔的额外允许 Origin |
 | `TRUST_PROXY` | `0` | 位于可信反向代理后时设为 `1` |
 | `ROOM_TTL_MS` | `600000` | 未配对房间有效期 |
+| `ROOM_RESUME_GRACE_MS` | `45000` | WebSocket 断开后的房间恢复窗口 |
 | `MAX_ROOMS` | `500` | 全局房间上限 |
 | `MAX_CLIENTS` | `1000` | WebSocket 连接上限 |
 | `MAX_CONNECTIONS_PER_MINUTE` | `60` | 单 IP 每分钟建连上限 |
@@ -121,6 +128,7 @@ TURN_CREDENTIAL="strong-password" \
 | `TURN_URLS` | 空 | 逗号分隔的 TURN/TURNS 地址 |
 | `TURN_SECRET` | 空 | 生成短期 TURN 凭据的共享密钥 |
 | `TURN_TTL_SECONDS` | `3600` | 短期 TURN 凭据有效期 |
+| `TURN_REQUIRED` | `0` | 设为 `1` 时，TURN 配置无效将拒绝启动 |
 | `TURN_USERNAME` / `TURN_CREDENTIAL` | 空 | 固定 TURN 凭据，仅建议测试 |
 
 `/api/ice-config` 会向浏览器返回 STUN/TURN 配置，TURN 动态用户名和密码不会写死在静态构建产物中。
@@ -133,6 +141,20 @@ TURN_CREDENTIAL="strong-password" \
 - 接收端必须在应用内点击“选择位置并接收”，这是浏览器要求用户手势才能打开文件保存选择器的安全限制
 - 文件队列最多 100 个文件；单个会话内的批次会按顺序传输
 - 纯 P2P 无法覆盖所有 NAT 组合，生产环境应配置 TURN
+
+## 自动化测试
+
+项目包含 Vitest、Node.js 回归测试和 Playwright 跨浏览器端到端测试：
+
+```bash
+npm test
+npm run test:e2e
+npm run test:e2e:chromium
+```
+
+首次运行 Playwright 前执行 `npx playwright install chromium firefox webkit`。
+
+Playwright 覆盖多文件传输、目录落盘、磁盘错误重试、信令恢复、DataChannel 恢复、扫码权限降级和分享链接预填。
 
 ## 安全设计
 

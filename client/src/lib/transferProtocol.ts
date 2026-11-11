@@ -48,7 +48,10 @@ export type ControlMessage =
   | { type: 'file-cancel'; fileId: string; reason: string }
   | { type: 'file-error'; fileId: string; reason: string }
   | { type: 'batch-pause'; batchId: string }
-  | { type: 'batch-resume'; batchId: string };
+  | { type: 'batch-resume'; batchId: string }
+  | { type: 'resume-request'; batchId: string; fileId: string }
+  | { type: 'resume-state'; batchId: string; fileId: string; offset: number }
+  | { type: 'resume-reject'; batchId: string; fileId: string; reason: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -142,6 +145,24 @@ export function parseControl(raw: string): ControlMessage | null {
       if (!isIdentifier(fileId)) return null;
       return { type: value.type, fileId, reason: asString(value.reason) || '文件传输失败' };
     }
+    case 'resume-request': {
+      const batchId = asString(value.batchId);
+      const fileId = asString(value.fileId);
+      return isIdentifier(batchId) && isIdentifier(fileId) ? { type: value.type, batchId, fileId } : null;
+    }
+    case 'resume-state': {
+      const batchId = asString(value.batchId);
+      const fileId = asString(value.fileId);
+      const offset = asNumber(value.offset);
+      if (!isIdentifier(batchId) || !isIdentifier(fileId) || offset === null || offset < 0 || !Number.isSafeInteger(offset)) return null;
+      return { type: value.type, batchId, fileId, offset };
+    }
+    case 'resume-reject': {
+      const batchId = asString(value.batchId);
+      const fileId = asString(value.fileId);
+      if (!isIdentifier(batchId) || !isIdentifier(fileId)) return null;
+      return { type: value.type, batchId, fileId, reason: asString(value.reason) || '无法恢复传输' };
+    }
     default:
       return null;
   }
@@ -158,6 +179,18 @@ export function sanitizeFileName(name: string): string {
     .trim()
     .replace(/^\.+$/, '');
   return (sanitized || 'download').slice(0, 255);
+}
+
+export function extractToken(value: string): string | null {
+  const trimmed = value.trim();
+  if (/^[A-HJ-NP-Za-hj-np-z2-9]{8}$/.test(trimmed)) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    const token = url.searchParams.get('token');
+    return token && /^[A-HJ-NP-Za-hj-np-z2-9]{8}$/.test(token) ? token : null;
+  } catch {
+    return null;
+  }
 }
 
 export function makeUniqueFileNames(files: FileMeta[]): string[] {

@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { createIceServers, getTurnConfiguration, validateTurnConfiguration } from './turnConfig.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -27,6 +28,7 @@ const INDEX_PATH = path.join(DIST_PATH, 'index.html');
 const STATIC_AVAILABLE = fs.existsSync(INDEX_PATH);
 
 const ROOM_TTL_MS = envInt('ROOM_TTL_MS', 10 * 60 * 1000, 30_000);
+const ROOM_RESUME_GRACE_MS = envInt('ROOM_RESUME_GRACE_MS', 45_000, 5_000);
 const MAX_ROOMS = envInt('MAX_ROOMS', 500);
 const MAX_CLIENTS = envInt('MAX_CLIENTS', 1000);
 const MAX_CONNECTIONS_PER_MINUTE = envInt('MAX_CONNECTIONS_PER_MINUTE', 60);
@@ -35,20 +37,16 @@ const MESSAGE_RATE_PER_SECOND = envInt('MESSAGE_RATE_PER_SECOND', 40);
 const MESSAGE_BURST = envInt('MESSAGE_BURST', 80);
 const MAX_SIGNAL_BYTES = envInt('MAX_SIGNAL_BYTES', 256 * 1024, 1024);
 
-const DEFAULT_STUN_URLS = [
-  'stun:stun.miwifi.com:3478',
-  'stun:stun.qq.com:3478',
-  'stun:stun.chat.bilibili.com:3478',
-  'stun:stun.l.google.com:19302',
-  'stun:stun1.l.google.com:19302'
-];
-const STUN_URLS = envList('STUN_URLS', DEFAULT_STUN_URLS);
-const TURN_URLS = envList('TURN_URLS');
-const TURN_SECRET = process.env.TURN_SECRET || '';
-const TURN_USERNAME = process.env.TURN_USERNAME || '';
-const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || '';
-const TURN_TTL_SECONDS = envInt('TURN_TTL_SECONDS', 3600, 60);
 const ALLOWED_ORIGINS = new Set(envList('ALLOWED_ORIGINS'));
+const TURN_CONFIG = getTurnConfiguration();
+const TURN_STATUS = validateTurnConfiguration(TURN_CONFIG);
+if (TURN_STATUS.warnings.length > 0) {
+  for (const warning of TURN_STATUS.warnings) console.warn(`TURN configuration: ${warning}`);
+}
+if (TURN_STATUS.errors.length > 0) {
+  for (const error of TURN_STATUS.errors) console.error(`TURN configuration: ${error}`);
+  process.exit(1);
+}
 
 const rooms = new Map();
 const clients = new Map();
@@ -87,6 +85,10 @@ function generateToken() {
     token = Array.from({ length: 8 }, () => TOKEN_CHARS[crypto.randomInt(TOKEN_CHARS.length)]).join('');
   } while (rooms.has(token));
   return token;
+}
+
+function generateSessionId() {
+  return crypto.randomBytes(24).toString('base64url');
 }
 
 function send(ws, type, data = {}) {
@@ -157,17 +159,58 @@ function validateSignalData(data) {
   if (data.type === 'ice') {
     return isPlainObject(data.candidate) && typeof data.candidate.candidate === 'string';
   }
+  if (data.type === 'recovery-request') return true;
   return false;
 }
 function cleanupRoom(token) {
   const room = rooms.get(token);
   if (!room) return;
+  for (const role of ['sender', 'receiver']) {
+    if (room.disconnectTimers?.[role]) clearTimeout(room.disconnectTimers[role]);
+  }
   for (const ws of [room.sender, room.receiver]) {
     if (!ws) continue;
     const info = clients.get(ws);
     if (info?.token === token) clients.delete(ws);
   }
   rooms.delete(token);
+}
+
+function handleSocketDisconnect(ws, message = '对方连接已断开') {
+  const info = clients.get(ws);
+  if (!info?.token) {
+    clients.delete(ws);
+    return;
+  }
+  const token = info.token;
+  const role = info.role;
+  const room = rooms.get(token);
+  if (!room || !role || room[role] !== ws) {
+    clients.delete(ws);
+    return;
+  }
+
+  const peerRole = role === 'sender' ? 'receiver' : 'sender';
+  const peer = room[peerRole];
+  if (peer && peer.readyState === WebSocket.OPEN) {
+    send(peer, 'peer-reconnecting', {
+      role,
+      graceUntil: Date.now() + ROOM_RESUME_GRACE_MS,
+      message
+    });
+  }
+
+  if (room.disconnectTimers[role]) clearTimeout(room.disconnectTimers[role]);
+  room.disconnectTimers[role] = setTimeout(() => {
+    if (rooms.get(token) !== room || room[role] !== ws) return;
+    const remainingPeer = role === 'sender' ? room.receiver : room.sender;
+    if (remainingPeer && remainingPeer.readyState === WebSocket.OPEN) {
+      send(remainingPeer, 'peer-left', { message: '对方未能在恢复窗口内重新连接' });
+    }
+    cleanupRoom(token);
+  }, ROOM_RESUME_GRACE_MS);
+  room.disconnectTimers[role].unref?.();
+  clients.delete(ws);
 }
 
 function leaveCurrentRoom(ws, message = '对方已离开') {
@@ -187,7 +230,7 @@ function leaveCurrentRoom(ws, message = '对方已离开') {
 function tryMatch(token) {
   const room = rooms.get(token);
   if (!room || room.matched) return;
-  if (room.sender && room.receiver) {
+  if (room.sender?.readyState === WebSocket.OPEN && room.receiver?.readyState === WebSocket.OPEN) {
     room.matched = true;
     send(room.sender, 'matched', { role: 'sender' });
     send(room.receiver, 'matched', { role: 'receiver' });
@@ -223,11 +266,18 @@ function handleClientMessage(ws, raw) {
       sender: role === 'sender' ? ws : null,
       receiver: role === 'receiver' ? ws : null,
       createdAt: Date.now(),
-      matched: false
+      matched: false,
+      sessions: { sender: role === 'sender' ? generateSessionId() : null, receiver: role === 'receiver' ? generateSessionId() : null },
+      disconnectTimers: { sender: null, receiver: null }
     });
     info.token = token;
     info.role = role;
-    send(ws, 'room-created', { token, expiresAt: Date.now() + ROOM_TTL_MS });
+    send(ws, 'room-created', {
+      token,
+      role,
+      expiresAt: Date.now() + ROOM_TTL_MS,
+      sessionId: rooms.get(token).sessions[role]
+    });
     tryMatch(token);
     return;
   }
@@ -248,9 +298,57 @@ function handleClientMessage(ws, raw) {
       });
     }
     room[role] = ws;
+    room.sessions[role] = generateSessionId();
+    if (room.disconnectTimers[role]) {
+      clearTimeout(room.disconnectTimers[role]);
+      room.disconnectTimers[role] = null;
+    }
     info.token = token;
     info.role = role;
-    send(ws, 'room-joined', { token, expiresAt: room.createdAt + ROOM_TTL_MS });
+    send(ws, 'room-joined', {
+      token,
+      role,
+      expiresAt: room.createdAt + ROOM_TTL_MS,
+      sessionId: room.sessions[role]
+    });
+    tryMatch(token);
+    return;
+  }
+
+  if (msg.type === 'resume-room') {
+    if (info.token) return send(ws, 'error', { message: '当前连接已加入房间' });
+    const { token, role, sessionId } = msg;
+    if (role !== 'sender' && role !== 'receiver') return send(ws, 'error', { message: '角色无效' });
+    if (typeof token !== 'string' || !TOKEN_RE.test(token)) {
+      return send(ws, 'error', { code: 'resume-failed', message: 'Token 格式无效' });
+    }
+    if (typeof sessionId !== 'string' || sessionId.length < 16) {
+      return send(ws, 'error', { code: 'resume-failed', message: '恢复凭据无效' });
+    }
+    const room = rooms.get(token);
+    if (!room || room.sessions[role] !== sessionId) {
+      return send(ws, 'error', { code: 'resume-failed', message: '会话已失效，无法恢复' });
+    }
+    const previous = room[role];
+    if (previous && previous.readyState === WebSocket.OPEN) {
+      return send(ws, 'error', { code: 'resume-failed', message: '当前角色已有活动连接' });
+    }
+    room[role] = ws;
+    if (room.disconnectTimers[role]) {
+      clearTimeout(room.disconnectTimers[role]);
+      room.disconnectTimers[role] = null;
+    }
+    info.token = token;
+    info.role = role;
+    send(ws, 'room-resumed', {
+      token,
+      role,
+      sessionId,
+      expiresAt: room.matched ? null : room.createdAt + ROOM_TTL_MS,
+      matched: room.matched
+    });
+    const peer = role === 'sender' ? room.receiver : room.sender;
+    if (peer && peer.readyState === WebSocket.OPEN) send(peer, 'peer-reconnected', { role });
     tryMatch(token);
     return;
   }
@@ -298,21 +396,6 @@ function sendJson(res, status, data, extraHeaders = {}) {
   res.end(body);
 }
 
-function buildIceServers() {
-  const iceServers = [];
-  if (STUN_URLS.length > 0) iceServers.push({ urls: STUN_URLS });
-  if (TURN_URLS.length === 0) return iceServers;
-
-  if (TURN_SECRET) {
-    const expires = Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS;
-    const username = `${expires}:airdropweb`;
-    const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
-    iceServers.push({ urls: TURN_URLS, username, credential });
-  } else if (TURN_USERNAME && TURN_CREDENTIAL) {
-    iceServers.push({ urls: TURN_URLS, username: TURN_USERNAME, credential: TURN_CREDENTIAL });
-  }
-  return iceServers;
-}
 async function serveFile(req, res, filePath) {
   let stat;
   try {
@@ -365,11 +448,12 @@ async function handleHttpRequest(req, res) {
       status: 'ok',
       rooms: rooms.size,
       clients: clients.size,
+      turnConfigured: TURN_STATUS.enabled,
       uptime: Math.round(process.uptime())
     });
   }
   if (url.pathname === '/api/ice-config') {
-    return sendJson(res, 200, { iceServers: buildIceServers() });
+    return sendJson(res, 200, { iceServers: createIceServers(TURN_CONFIG) });
   }
 
   let pathname;
@@ -459,8 +543,7 @@ wss.on('connection', (ws, req) => {
     const count = (connectionsByIp.get(ip) || 1) - 1;
     if (count > 0) connectionsByIp.set(ip, count);
     else connectionsByIp.delete(ip);
-    leaveCurrentRoom(ws, '对方连接已断开');
-    clients.delete(ws);
+    handleSocketDisconnect(ws);
   });
 });
 

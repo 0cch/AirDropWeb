@@ -13,10 +13,14 @@
     "build": "npm run build --workspace p2p-file-transfer-client",
     "typecheck": "npm run typecheck --workspace p2p-file-transfer-client",
     "test": "npm run test --workspace p2p-file-transfer-client && npm run test --workspace p2p-signaling-server",
+    "test:e2e": "playwright test",
+    "test:e2e:chromium": "playwright test --project=chromium",
+    "test:all": "npm run typecheck && npm test && npm run test:e2e && npm run build",
     "start": "npm run start --workspace p2p-signaling-server",
     "audit:prod": "npm audit --omit=dev"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "concurrently": "^10.0.7"
   }
 }

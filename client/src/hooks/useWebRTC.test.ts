@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { makeUniqueFileNames, parseControl, sanitizeFileName } from '../lib/transferProtocol';
+import { extractToken, makeUniqueFileNames, parseControl, sanitizeFileName } from '../lib/transferProtocol';
 
 describe('parseControl', () => {
   it('rejects malformed control messages', () => {
@@ -48,6 +48,13 @@ describe('parseControl', () => {
       type: 'batch-pause',
       batchId: 'batch-1'
     });
+    expect(parseControl('{"type":"resume-state","batchId":"batch-1","fileId":"file-1","offset":4096}')).toEqual({
+      type: 'resume-state',
+      batchId: 'batch-1',
+      fileId: 'file-1',
+      offset: 4096
+    });
+    expect(parseControl('{"type":"resume-state","batchId":"batch-1","fileId":"file-1","offset":-1}')).toBeNull();
   });
 });
 
@@ -58,5 +65,11 @@ describe('file name safety', () => {
       { name: 'photo.jpg', size: 1, type: 'image/jpeg' },
       { name: 'photo.jpg', size: 1, type: 'image/jpeg' }
     ])).toEqual(['photo.jpg', 'photo (1).jpg']);
+  });
+
+  it('extracts tokens from manual input and shared links', () => {
+    expect(extractToken('ABCD2345')).toBe('ABCD2345');
+    expect(extractToken('https://example.com/?token=ABCD2345')).toBe('ABCD2345');
+    expect(extractToken('https://example.com/?token=invalid')).toBeNull();
   });
 });

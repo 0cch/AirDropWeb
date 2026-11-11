@@ -230,11 +230,14 @@ Environment=PORT=$PORT
 Environment=HOST=$HOST
 Environment=NODE_ENV=production
 Environment=TRUST_PROXY=$TRUST_PROXY_VALUE
+Environment="ROOM_RESUME_GRACE_MS=${ROOM_RESUME_GRACE_MS:-45000}"
 Environment="ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}"
 Environment="TURN_URLS=${TURN_URLS:-}"
 Environment="TURN_SECRET=${TURN_SECRET:-}"
 Environment="TURN_USERNAME=${TURN_USERNAME:-}"
 Environment="TURN_CREDENTIAL=${TURN_CREDENTIAL:-}"
+Environment="TURN_REQUIRED=${TURN_REQUIRED:-0}"
+Environment="TURN_REQUIRED=${TURN_REQUIRED:-0}"
 ExecStart=$(which node) $APP_DIR/server/index.js
 Restart=on-failure
 RestartSec=5

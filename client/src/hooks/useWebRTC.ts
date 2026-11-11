@@ -41,6 +41,7 @@ export type TransferStatus =
   | 'sending'
   | 'receiving'
   | 'paused'
+  | 'recovering'
   | 'done'
   | 'cancelled'
   | 'error';
@@ -91,6 +92,7 @@ interface TxState {
   credits: number;
   accepted: boolean;
   cancelled: boolean;
+  attempt: number;
   startedAt: number;
 }
 
@@ -141,7 +143,8 @@ function makeQueue(files: QueueFileMeta[]): TransferQueueItem[] {
 export function useWebRTC(
   sendSignal: (data: unknown) => boolean | void,
   onSignal: (cb: (data: unknown) => void) => void,
-  myRole: 'sender' | 'receiver' | null
+  myRole: 'sender' | 'receiver' | null,
+  signalingConnected: boolean
 ) {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
@@ -150,6 +153,11 @@ export function useWebRTC(
   const remoteDescriptionSetRef = useRef(false);
   const connectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recoveryAttemptsRef = useRef(0);
+  const recoveryCountRef = useRef(0);
+  const recoveringRef = useRef(false);
+  const completedFileIdsRef = useRef(new Set<string>());
   const creditWaiterRef = useRef<(() => void) | null>(null);
   const resumeWaiterRef = useRef<(() => void) | null>(null);
   const batchRef = useRef<BatchState | null>(null);
@@ -162,6 +170,8 @@ export function useWebRTC(
   const failureRef = useRef<(message: string, notifyPeer?: boolean, fatal?: boolean) => void>(() => {});
   const controlHandlerRef = useRef<(message: ControlMessage) => void>(() => {});
   const chunkHandlerRef = useRef<(data: ArrayBuffer) => void>(() => {});
+  const dataChannelOpenRef = useRef<(dc: RTCDataChannel) => void>(() => {});
+  const recoveryRef = useRef<(reason: string) => void>(() => {});
 
   const [dcReady, setDcReady] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -183,6 +193,11 @@ export function useWebRTC(
   const clearConnectionTimer = useCallback(() => {
     if (connectionTimerRef.current) clearTimeout(connectionTimerRef.current);
     connectionTimerRef.current = null;
+  }, []);
+
+  const clearRecoveryTimer = useCallback(() => {
+    if (recoveryTimerRef.current) clearTimeout(recoveryTimerRef.current);
+    recoveryTimerRef.current = null;
   }, []);
 
   const sendControl = useCallback((message: ControlMessage) => {
@@ -260,13 +275,16 @@ export function useWebRTC(
       clearConnectionTimer();
       setDcReady(true);
       setTransferError(null);
+      dataChannelOpenRef.current(dc);
     };
     dc.onclose = () => {
+      if (dcRef.current !== dc) return;
+      dcRef.current = null;
       setDcReady(false);
-      if (batchRef.current) failureRef.current('数据通道已断开，本次传输未完成', false, true);
+      if (batchRef.current) recoveryRef.current('数据通道已断开');
     };
     dc.onerror = () => {
-      failureRef.current('数据通道发生错误', false, true);
+      if (batchRef.current) recoveryRef.current('数据通道发生错误');
     };
     dc.onmessage = (event) => {
       if (typeof event.data === 'string') {
@@ -306,19 +324,23 @@ export function useWebRTC(
       if (event.candidate) sendSignal({ type: 'ice', candidate: event.candidate });
     };
     pc.onconnectionstatechange = () => {
+      if (pcRef.current !== pc) return;
       if (pc.connectionState === 'connected') {
         clearConnectionTimer();
         void inspectConnectionRoute(pc);
       }
       if (pc.connectionState === 'failed') {
         setConnectionRoute('failed');
-        failureRef.current('无法建立 WebRTC 连接，可能需要 TURN 中继', false, true);
+        if (batchRef.current) recoveryRef.current('WebRTC 连接失败');
+        else failureRef.current('无法建立 WebRTC 连接，可能需要 TURN 中继', false, true);
       }
     };
     pc.oniceconnectionstatechange = () => {
+      if (pcRef.current !== pc) return;
       if (pc.iceConnectionState === 'failed') {
         setConnectionRoute('failed');
-        failureRef.current('WebRTC 连接失败，请重试或配置 TURN', false, true);
+        if (batchRef.current) recoveryRef.current('WebRTC 连接失败');
+        else failureRef.current('WebRTC 连接失败，请重试或配置 TURN', false, true);
       }
     };
 
@@ -331,7 +353,8 @@ export function useWebRTC(
     connectionTimerRef.current = setTimeout(() => {
       if (!dcRef.current || dcRef.current.readyState !== 'open') {
         setConnectionRoute('failed');
-        failureRef.current('WebRTC 连接超时，可能需要 TURN 中继', false, true);
+        if (batchRef.current) recoveryRef.current('WebRTC 连接超时');
+        else failureRef.current('WebRTC 连接超时，可能需要 TURN 中继', false, true);
       }
     }, CONNECTION_TIMEOUT_MS);
 
@@ -348,7 +371,19 @@ export function useWebRTC(
 
   const handleSignal = useCallback(async (data: unknown) => {
     if (!isRecord(data) || typeof data.type !== 'string') return;
+    if (data.type === 'recovery-request') {
+      if (myRole === 'sender' && batchRef.current) recoveryRef.current('对方请求恢复连接');
+      return;
+    }
     try {
+      if (data.type === 'offer' && pcRef.current) {
+        const previousPc = pcRef.current;
+        const previousDc = dcRef.current;
+        pcRef.current = null;
+        dcRef.current = null;
+        try { previousDc?.close(); } catch {}
+        try { previousPc.close(); } catch {}
+      }
       const pc = pcRef.current || (myRole === 'receiver' ? await initPeer() : null);
       if (!pc) return;
 
@@ -369,7 +404,8 @@ export function useWebRTC(
     } catch (error) {
       const message = error instanceof Error ? error.message : '信令处理失败';
       setConnectionRoute('failed');
-      failureRef.current(`WebRTC 协商失败：${message}`, false, true);
+      if (batchRef.current) recoveryRef.current(`WebRTC 协商失败：${message}`);
+      else failureRef.current(`WebRTC 协商失败：${message}`, false, true);
     }
   }, [flushPendingCandidates, initPeer, myRole, sendSignal]);
 
@@ -398,6 +434,9 @@ export function useWebRTC(
     const index = tx?.index ?? rx?.index ?? batch?.currentIndex ?? 0;
     clearConnectionTimer();
     clearTransferTimer();
+    clearRecoveryTimer();
+    recoveringRef.current = false;
+    recoveryAttemptsRef.current = 0;
     pausedRef.current = false;
     setIsPaused(false);
     txRef.current = null;
@@ -419,11 +458,12 @@ export function useWebRTC(
     }
     if (fatal) {
       setConnectionRoute('failed');
+      setDcReady(false);
       if (batch) batch.accepted = false;
     }
     setTransferStatus('error');
     setTransferError(message);
-  }, [clearConnectionTimer, clearTransferTimer, sendControl, setQueueItem]);
+  }, [clearConnectionTimer, clearRecoveryTimer, clearTransferTimer, sendControl, setQueueItem]);
 
   const acceptBatch = useCallback(async () => {
     const batch = batchRef.current;
@@ -476,6 +516,15 @@ export function useWebRTC(
     const expected = manifest.name === message.meta.name && manifest.size === message.meta.size && manifest.type === message.meta.type;
     if (manifest.id !== message.fileId || !expected) {
       failureRef.current('文件信息与队列清单不一致', true);
+      return;
+    }
+    if (rxRef.current) {
+      if (rxRef.current.fileId === message.fileId) {
+        setTransferStatus('receiving');
+        sendControl({ type: 'file-accept', fileId: message.fileId });
+      } else {
+        failureRef.current('接收端已有其他文件正在传输', true);
+      }
       return;
     }
 
@@ -587,6 +636,7 @@ export function useWebRTC(
       setProgress(100);
       setBatchProgress(Math.min(100, (batch.completedBytes / batch.totalBytes) * 100));
       sendControl({ type: 'file-ack', fileId: rx.fileId });
+      completedFileIdsRef.current.add(rx.fileId);
 
       if (isLast) {
         pausedRef.current = false;
@@ -622,9 +672,10 @@ export function useWebRTC(
   }, []);
 
   const waitForCredit = useCallback(async (tx: TxState) => {
-    while (!tx.cancelled && txRef.current === tx) {
+    const attempt = tx.attempt;
+    while (!tx.cancelled && txRef.current === tx && tx.attempt === attempt) {
       await waitWhilePaused();
-      if (txRef.current !== tx) throw new Error('传输已取消');
+      if (txRef.current !== tx || tx.attempt !== attempt) throw new Error('传输已取消');
       if (tx.credits > 0) {
         tx.credits -= 1;
         return;
@@ -639,7 +690,7 @@ export function useWebRTC(
           resolve();
         };
       });
-      if (tx.cancelled || txRef.current !== tx) throw new Error('传输已取消');
+      if (tx.cancelled || txRef.current !== tx || tx.attempt !== attempt) throw new Error('传输已取消');
     }
     throw new Error('传输已取消');
   }, [waitWhilePaused]);
@@ -648,7 +699,15 @@ export function useWebRTC(
     if (dc.bufferedAmount <= MAX_BUFFERED_BYTES) return;
     await new Promise<void>((resolve, reject) => {
       let settled = false;
-      const cleanup = () => dc.removeEventListener('bufferedamountlow', onLow);
+      const attempt = tx.attempt;
+      const watchdog = setInterval(() => {
+        if (dc.readyState !== 'open') finish(new Error('数据通道已断开'));
+        if (tx.cancelled || tx.attempt !== attempt) finish(new Error('传输已取消'));
+      }, 200);
+      const cleanup = () => {
+        clearInterval(watchdog);
+        dc.removeEventListener('bufferedamountlow', onLow);
+      };
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
@@ -666,13 +725,14 @@ export function useWebRTC(
     });
   }, []);
 
-  const sendLoop = useCallback(async (tx: TxState) => {
+  const sendLoop = useCallback(async (tx: TxState, startOffset = 0) => {
     const dc = dcRef.current;
     if (!dc || dc.readyState !== 'open') throw new Error('数据通道尚未就绪');
     if (txRef.current !== tx) return;
+    const attempt = tx.attempt;
 
-    for (let offset = 0; offset < tx.file.size; offset += CHUNK_SIZE) {
-      if (tx.cancelled || txRef.current !== tx) return;
+    for (let offset = startOffset; offset < tx.file.size; offset += CHUNK_SIZE) {
+      if (tx.cancelled || txRef.current !== tx || tx.attempt !== attempt) return;
       await waitForCredit(tx);
       await waitWhilePaused();
       await waitForBuffer(dc, tx);
@@ -680,7 +740,7 @@ export function useWebRTC(
       if (dc.readyState !== 'open') throw new Error('数据通道已断开');
       const end = Math.min(offset + CHUNK_SIZE, tx.file.size);
       const buffer = await tx.file.slice(offset, end).arrayBuffer();
-      if (tx.cancelled || txRef.current !== tx) return;
+      if (tx.cancelled || txRef.current !== tx || tx.attempt !== attempt) return;
       dc.send(buffer);
       tx.sentBytes = end;
       updateProgress(tx.sentBytes, tx.file.size, tx.startedAt);
@@ -712,6 +772,7 @@ export function useWebRTC(
       credits: 0,
       accepted: false,
       cancelled: false,
+      attempt: 0,
       startedAt: performance.now()
     };
     setTransferError(null);
@@ -730,6 +791,66 @@ export function useWebRTC(
       failureRef.current('无法发送文件信息，数据通道已断开', false, true);
     }
   }, [armTransferTimeout, sendControl, setQueueItem]);
+
+  const attemptConnectionRecovery = useCallback((reason: string) => {
+    if (!batchRef.current) {
+      failureRef.current(reason, false, true);
+      return;
+    }
+    if (recoveringRef.current) return;
+    recoveringRef.current = true;
+    recoveryAttemptsRef.current += 1;
+    recoveryCountRef.current += 1;
+    if (txRef.current) txRef.current.attempt += 1;
+    creditWaiterRef.current?.();
+    creditWaiterRef.current = null;
+    resumeWaiterRef.current?.();
+    resumeWaiterRef.current = null;
+    clearTransferTimer();
+    clearConnectionTimer();
+    clearRecoveryTimer();
+    setDcReady(false);
+    setConnectionRoute('unknown');
+    setTransferStatus('recovering');
+    setTransferError(null);
+
+    const previousPc = pcRef.current;
+    const previousDc = dcRef.current;
+    pcRef.current = null;
+    dcRef.current = null;
+    try { previousDc?.close(); } catch {}
+    try { previousPc?.close(); } catch {}
+
+    const retry = (message: string) => {
+      recoveringRef.current = false;
+      clearRecoveryTimer();
+      if (!batchRef.current) return;
+      if (recoveryAttemptsRef.current >= 12) {
+        failureRef.current('连接恢复失败，请重新配对', false, true);
+        return;
+      }
+      const delay = Math.min(5000, 1000 * recoveryAttemptsRef.current);
+      recoveryTimerRef.current = setTimeout(() => recoveryRef.current(message), delay);
+    };
+
+    const start = async () => {
+      if (!signalingConnected) throw new Error('等待信令连接恢复');
+      if (myRole === 'sender') {
+        const pc = await initPeer();
+        const offer = await pc.createOffer({ iceRestart: true });
+        await pc.setLocalDescription(offer);
+        if (sendSignal({ type: 'offer', sdp: offer }) === false) throw new Error('信令服务器暂时不可用');
+      } else {
+        sendSignal({ type: 'recovery-request' });
+      }
+      clearRecoveryTimer();
+      recoveryTimerRef.current = setTimeout(() => retry('未收到恢复协商'), 12_000);
+    };
+
+    void start().catch((error) => {
+      retry(error instanceof Error ? error.message : '连接恢复失败');
+    });
+  }, [clearConnectionTimer, clearRecoveryTimer, clearTransferTimer, initPeer, myRole, sendSignal, signalingConnected]);
 
   const pauseTransfer = useCallback(() => {
     const batch = batchRef.current;
@@ -838,8 +959,8 @@ export function useWebRTC(
       setTransferError(null);
       armTransferTimeout('接收方长时间没有响应');
       sendLoop(tx).catch((error) => {
-        if (tx.cancelled || txRef.current !== tx) return;
-        failureRef.current(error instanceof Error ? error.message : '发送文件失败', true);
+        if (tx.cancelled || txRef.current !== tx || tx.attempt !== 0) return;
+        recoveryRef.current(error instanceof Error ? error.message : '发送文件失败');
       });
       return;
     }
@@ -867,6 +988,10 @@ export function useWebRTC(
       const tx = txRef.current;
       if (!batch || !tx || tx.fileId !== message.fileId) return;
       clearTransferTimer();
+      clearRecoveryTimer();
+      recoveringRef.current = false;
+      recoveryAttemptsRef.current = 0;
+      setDcReady(true);
       txRef.current = null;
       const isLast = tx.index === batch.files.length - 1;
       setQueueItem(tx.index, { status: 'done', transferred: tx.file.size, error: undefined });
@@ -899,6 +1024,74 @@ export function useWebRTC(
       return;
     }
 
+    if (message.type === 'resume-request') {
+      const batch = batchRef.current;
+      if (!batch || batch.direction !== 'receiver' || batch.batchId !== message.batchId) {
+        sendControl({ type: 'resume-reject', batchId: message.batchId, fileId: message.fileId, reason: '接收方没有可恢复的会话' });
+        return;
+      }
+      if (completedFileIdsRef.current.has(message.fileId)) {
+        clearRecoveryTimer();
+        recoveringRef.current = false;
+        recoveryAttemptsRef.current = 0;
+        sendControl({ type: 'file-ack', fileId: message.fileId });
+        return;
+      }
+      const rx = rxRef.current;
+      if (!rx || rx.fileId !== message.fileId) {
+        sendControl({ type: 'resume-reject', batchId: message.batchId, fileId: message.fileId, reason: '接收端没有当前文件的写入状态' });
+        return;
+      }
+      clearRecoveryTimer();
+      recoveringRef.current = false;
+      recoveryAttemptsRef.current = 0;
+      setDcReady(true);
+      setTransferStatus('receiving');
+      armTransferTimeout('文件恢复后长时间没有进展');
+      void rx.writeChain.then(() => {
+        if (rxRef.current !== rx || rx.failed) return;
+        sendControl({ type: 'resume-state', batchId: message.batchId, fileId: message.fileId, offset: rx.bytesReceived });
+      });
+      return;
+    }
+
+    if (message.type === 'resume-state') {
+      const batch = batchRef.current;
+      const tx = txRef.current;
+      if (!batch || !tx || batch.direction !== 'sender' || batch.batchId !== message.batchId || tx.fileId !== message.fileId) return;
+      if (message.offset > tx.file.size) {
+        failureRef.current('恢复位置无效，传输已中止', false, true);
+        return;
+      }
+      clearRecoveryTimer();
+      recoveringRef.current = false;
+      recoveryAttemptsRef.current = 0;
+      tx.attempt += 1;
+      tx.accepted = true;
+      tx.sentBytes = message.offset;
+      tx.credits = INITIAL_CREDIT_CHUNKS;
+      tx.startedAt = performance.now();
+      setDcReady(true);
+      setTransferStatus('sending');
+      setTransferError(null);
+      setQueueItem(tx.index, { transferred: message.offset });
+      updateProgress(message.offset, tx.file.size, tx.startedAt);
+      armTransferTimeout('文件恢复后长时间没有响应');
+      const attempt = tx.attempt;
+      sendLoop(tx, message.offset).catch((error) => {
+        if (txRef.current !== tx || tx.attempt !== attempt) return;
+        recoveryRef.current(error instanceof Error ? error.message : '恢复发送失败');
+      });
+      return;
+    }
+
+    if (message.type === 'resume-reject') {
+      const activeId = txRef.current?.fileId || rxRef.current?.fileId;
+      if (activeId && activeId !== message.fileId) return;
+      failureRef.current(message.reason, false, true);
+      return;
+    }
+
     if (message.type === 'batch-pause') {
       const batch = batchRef.current;
       if (!batch || batch.batchId !== message.batchId) return;
@@ -916,7 +1109,7 @@ export function useWebRTC(
       if (batchRef.current?.batchId !== message.batchId) return;
       applyResume(false);
     }
-  }, [applyResume, armTransferTimeout, clearTransferTimer, finalizeReceiver, myRole, prepareIncomingFile, sendControl, sendLoop, setQueueItem, startSenderFile]);
+  }, [applyResume, armTransferTimeout, clearRecoveryTimer, clearTransferTimer, finalizeReceiver, myRole, prepareIncomingFile, sendControl, sendLoop, setQueueItem, startSenderFile, updateProgress]);
 
   const handleChunk = useCallback((data: ArrayBuffer) => {
     if (!rxRef.current) {
@@ -927,11 +1120,50 @@ export function useWebRTC(
     consumeChunk(data);
   }, [consumeChunk]);
 
+  const handleDataChannelOpen = useCallback(() => {
+    const batch = batchRef.current;
+    if (!batch) return;
+    clearRecoveryTimer();
+    setDcReady(true);
+    if (myRole === 'sender') {
+      const tx = txRef.current;
+      if (tx?.accepted) {
+        sendControl({ type: 'resume-request', batchId: batch.batchId, fileId: tx.fileId });
+        armTransferTimeout('等待接收方返回恢复位置', 15_000);
+      } else if (batch.accepted) {
+        startSenderFile(batch.currentIndex);
+      }
+    } else {
+      armTransferTimeout('等待发送方恢复传输', 15_000);
+    }
+  }, [armTransferTimeout, clearRecoveryTimer, myRole, sendControl, startSenderFile]);
+
   useEffect(() => {
     failureRef.current = handleTransferFailure;
     controlHandlerRef.current = handleControl;
     chunkHandlerRef.current = handleChunk;
-  }, [handleChunk, handleControl, handleTransferFailure]);
+    dataChannelOpenRef.current = handleDataChannelOpen;
+    recoveryRef.current = attemptConnectionRecovery;
+  }, [attemptConnectionRecovery, handleChunk, handleControl, handleDataChannelOpen, handleTransferFailure]);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || import.meta.env.VITE_E2E !== '1') return;
+    const testWindow = window as Window & {
+      __airdropTest?: {
+        dropDataChannel?: () => void;
+        getRecoveryCount?: () => number;
+      };
+    };
+    testWindow.__airdropTest = {
+      ...testWindow.__airdropTest,
+      dropDataChannel: () => dcRef.current?.close(),
+      getRecoveryCount: () => recoveryCountRef.current
+    };
+    return () => {
+      if (testWindow.__airdropTest) delete testWindow.__airdropTest.dropDataChannel;
+      if (testWindow.__airdropTest) delete testWindow.__airdropTest.getRecoveryCount;
+    };
+  }, []);
   const sendFiles = useCallback((files: File[]) => {
     const dc = dcRef.current;
     if (!dc || dc.readyState !== 'open') {
@@ -969,6 +1201,7 @@ export function useWebRTC(
       savedNames: makeUniqueFileNames(metadata)
     };
     pausedRef.current = false;
+    completedFileIdsRef.current.clear();
     setIsPaused(false);
     setQueue(makeQueue(metadata));
     setReceivedFiles([]);
@@ -1004,6 +1237,9 @@ export function useWebRTC(
     const rx = rxRef.current;
     const index = tx?.index ?? rx?.index ?? batch.currentIndex;
     clearTransferTimer();
+    clearRecoveryTimer();
+    recoveringRef.current = false;
+    recoveryAttemptsRef.current = 0;
     pausedRef.current = false;
     batch.paused = false;
     batch.accepted = false;
@@ -1030,7 +1266,7 @@ export function useWebRTC(
     setQueueItem(index, { status: 'error', error: '已取消' });
     setTransferStatus('cancelled');
     setTransferError(null);
-  }, [clearTransferTimer, sendControl, setQueueItem]);
+  }, [clearRecoveryTimer, clearTransferTimer, sendControl, setQueueItem]);
 
   const close = useCallback(() => {
     const batch = batchRef.current;
@@ -1057,6 +1293,9 @@ export function useWebRTC(
     resumeWaiterRef.current = null;
     clearTransferTimer();
     clearConnectionTimer();
+    clearRecoveryTimer();
+    recoveringRef.current = false;
+    recoveryAttemptsRef.current = 0;
     const dc = dcRef.current;
     const pc = pcRef.current;
     dcRef.current = null;
@@ -1074,7 +1313,7 @@ export function useWebRTC(
     setIsPaused(false);
     setConnectionRoute('unknown');
     setTransferElapsedSeconds(null);
-  }, [clearConnectionTimer, clearTransferTimer, sendControl]);
+  }, [clearConnectionTimer, clearRecoveryTimer, clearTransferTimer, sendControl]);
 
   return {
     dcReady,

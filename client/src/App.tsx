@@ -15,6 +15,8 @@ import { ActionButton } from './components/ActionButton';
 import { Progress } from './components/Progress';
 import { Icon } from './components/Icon';
 import { QrCode } from './components/QrCode';
+import { QrScanner } from './components/QrScanner';
+import { extractToken } from './lib/transferProtocol';
 
 type Screen = 'home' | 'waiting' | 'join' | 'transfer';
 type CopiedTarget = 'token' | 'link' | null;
@@ -45,18 +47,6 @@ function formatDuration(seconds: number | null): string {
   const minutes = Math.floor(seconds / 60);
   const remainder = Math.round(seconds % 60);
   return `${minutes} 分 ${remainder} 秒`;
-}
-
-function extractToken(value: string): string | null {
-  const trimmed = value.trim();
-  if (TOKEN_PATTERN.test(trimmed)) return trimmed;
-  try {
-    const url = new URL(trimmed);
-    const token = url.searchParams.get('token');
-    return token && TOKEN_PATTERN.test(token) ? token : null;
-  } catch {
-    return null;
-  }
 }
 
 async function copyText(value: string): Promise<boolean> {
@@ -132,9 +122,9 @@ export default function App() {
     isPaused,
     connectionRoute,
     transferElapsedSeconds
-  } = useWebRTC(signaling.sendSignal, registerSignalHandler, signaling.myRole);
+  } = useWebRTC(signaling.sendSignal, registerSignalHandler, signaling.myRole, signaling.connected);
 
-  useWakeLock(screen === 'transfer' && (transferStatus === 'sending' || transferStatus === 'receiving' || transferStatus === 'paused'));
+  useWakeLock(screen === 'transfer' && (transferStatus === 'sending' || transferStatus === 'receiving' || transferStatus === 'paused' || transferStatus === 'recovering'));
 
   const goHome = useCallback((message: string | null, reconnect: boolean) => {
     close();
@@ -180,7 +170,7 @@ export default function App() {
   }, [createOffer, signaling.matched, signaling.myRole]);
 
   useEffect(() => {
-    if (screen !== 'transfer' || !['sending', 'receiving', 'paused'].includes(transferStatus)) return;
+    if (screen !== 'transfer' || !['sending', 'receiving', 'paused', 'recovering'].includes(transferStatus)) return;
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = '';
@@ -212,13 +202,17 @@ export default function App() {
     setScreen('join');
   };
 
-  const handleJoin = () => {
-    const token = extractToken(inputToken);
-    if (!token || !signaling.connected) return;
+  const joinWithToken = (token: string) => {
+    if (!signaling.connected) return;
     setInputToken(token);
     setSessionMessage(null);
     signaling.joinRoom('receiver', token);
     setScreen('waiting');
+  };
+
+  const handleJoin = () => {
+    const token = extractToken(inputToken);
+    if (token) joinWithToken(token);
   };
 
   const handleTokenInput = (value: string) => {
@@ -304,6 +298,7 @@ export default function App() {
             connected={signaling.connected}
             onTokenChange={handleTokenInput}
             onJoin={handleJoin}
+            onScannedToken={joinWithToken}
             onBack={() => setScreen('home')}
             error={signaling.error}
           />
@@ -312,6 +307,7 @@ export default function App() {
         {screen === 'transfer' && (
           <TransferScreen
             myRole={signaling.myRole}
+            peerState={signaling.peerState}
             dcReady={dcReady}
             progress={progress}
             batchProgress={batchProgress}
@@ -487,12 +483,14 @@ interface JoinScreenProps {
   connected: boolean;
   onTokenChange: (value: string) => void;
   onJoin: () => void;
+  onScannedToken: (token: string) => void;
   onBack: () => void;
   error: string | null;
 }
 
-function JoinScreen({ inputToken, connected, onTokenChange, onJoin, onBack, error }: JoinScreenProps) {
+function JoinScreen({ inputToken, connected, onTokenChange, onJoin, onScannedToken, onBack, error }: JoinScreenProps) {
   const tokenValid = TOKEN_PATTERN.test(inputToken.trim());
+  const [scanning, setScanning] = useState(false);
 
   const handlePaste = async () => {
     try {
@@ -511,6 +509,10 @@ function JoinScreen({ inputToken, connected, onTokenChange, onJoin, onBack, erro
       </div>
       <h2 tabIndex={-1} className="text-2xl font-semibold text-center mb-2 focus:outline-none">输入 Token</h2>
       <p className="text-apple-gray-text text-sm text-center mb-6">可粘贴 8 位 Token，也可以直接粘贴分享链接</p>
+
+      <button type="button" onClick={() => setScanning(true)} className="secondary-action mb-4 w-full">
+        <Icon name="qr" size={18} />扫描邀请二维码
+      </button>
 
       <div className="relative mb-4">
         <input
@@ -540,10 +542,19 @@ function JoinScreen({ inputToken, connected, onTokenChange, onJoin, onBack, erro
           返回首页
         </button>
       </div>
+      {scanning && (
+        <QrScanner
+          onClose={() => setScanning(false)}
+          onResult={(token) => {
+            setScanning(false);
+            onScannedToken(token);
+          }}
+        />
+      )}
     </GlassCard>
   );
 }
-function ConnectionStatusBar({ route, dcReady, paused }: { route: ConnectionRoute; dcReady: boolean; paused: boolean }) {
+function ConnectionStatusBar({ route, dcReady, paused, peerState }: { route: ConnectionRoute; dcReady: boolean; paused: boolean; peerState: 'connected' | 'reconnecting' }) {
   const routeIcon = route === 'turn' ? 'relay' : route === 'failed' ? 'alert' : 'wifi';
   return (
     <div className="mb-5 flex flex-wrap items-center justify-center gap-2 text-[11px] font-medium" aria-label="连接状态">
@@ -554,6 +565,11 @@ function ConnectionStatusBar({ route, dcReady, paused }: { route: ConnectionRout
       {dcReady && (
         <span className="status-pill bg-blue-50 text-blue-700">
           <Icon name="shield" size={14} />端到端加密
+        </span>
+      )}
+      {peerState === 'reconnecting' && (
+        <span className="status-pill bg-amber-50 text-amber-800">
+          <Icon name="retry" size={14} />对方信令重连中
         </span>
       )}
       {paused && (
@@ -641,6 +657,7 @@ function CompletionSummary({ items, route, elapsed }: { items: TransferQueueItem
 
 interface TransferScreenProps {
   myRole: Role | null;
+  peerState: 'connected' | 'reconnecting';
   dcReady: boolean;
   progress: number;
   batchProgress: number;
@@ -665,6 +682,7 @@ interface TransferScreenProps {
 
 function TransferScreen({
   myRole,
+  peerState,
   dcReady,
   progress,
   batchProgress,
@@ -689,7 +707,8 @@ function TransferScreen({
   const [dragOver, setDragOver] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const isSender = myRole === 'sender';
-  const isBusy = transferStatus === 'awaiting-accept' || transferStatus === 'sending' || transferStatus === 'receiving' || transferStatus === 'paused';
+  const isBusy = transferStatus === 'awaiting-accept' || transferStatus === 'sending' || transferStatus === 'receiving'
+    || transferStatus === 'paused' || transferStatus === 'recovering';
   const activeIndex = queue.findIndex((item) => item.status === 'active');
   const activeItem = activeIndex >= 0 ? queue[activeIndex] : null;
   const totalBytes = queue.reduce((sum, item) => sum + item.size, 0);
@@ -725,7 +744,7 @@ function TransferScreen({
         <p className="text-apple-gray-text text-sm mt-1">{dcReady ? '对方已连接' : '正在建立 WebRTC 通道...'}</p>
       </div>
 
-      {dcReady && <ConnectionStatusBar route={connectionRoute} dcReady={dcReady} paused={isPaused} />}
+      {(dcReady || transferStatus === 'recovering') && <ConnectionStatusBar route={connectionRoute} dcReady={dcReady} paused={isPaused} peerState={peerState} />}
 
       {transferStatus === 'idle' && isSender && (dcReady ? picker : (
         <div className="rounded-xl bg-gray-50 p-5 text-center text-sm text-apple-gray-text" role="status">通道建立后即可选择文件。</div>
@@ -773,12 +792,12 @@ function TransferScreen({
         </div>
       )}
 
-      {(transferStatus === 'sending' || transferStatus === 'receiving' || transferStatus === 'paused') && (
+      {(transferStatus === 'sending' || transferStatus === 'receiving' || transferStatus === 'paused' || transferStatus === 'recovering') && (
         <div>
           <QueueList items={queue} />
           <div className="mt-5 text-center" aria-live="polite">
             <p className="font-medium mb-2 truncate">
-              {isPaused ? '传输已暂停' : transferStatus === 'sending' ? '正在发送' : activeItem ? '正在接收' : '准备接收下一个文件'}
+              {transferStatus === 'recovering' ? '正在恢复连接...' : isPaused ? '传输已暂停' : transferStatus === 'sending' ? '正在发送' : activeItem ? '正在接收' : '准备接收下一个文件'}
             </p>
             {activeItem && <p className="mb-3 truncate text-xs text-apple-gray-text">{activeItem.name}</p>}
             <Progress percent={mainProgress} />
@@ -789,10 +808,12 @@ function TransferScreen({
             </div>
           </div>
 
-          <div className="mt-4 grid grid-cols-2 gap-2.5">
-            <button type="button" onClick={isPaused ? onResume : onPause} className="secondary-action">
-              <Icon name={isPaused ? 'play' : 'pause'} size={17} />{isPaused ? '继续传输' : '暂停'}
-            </button>
+          <div className={`mt-4 grid gap-2.5 ${transferStatus === 'recovering' ? 'grid-cols-1' : 'grid-cols-2'}`}>
+            {transferStatus !== 'recovering' && (
+              <button type="button" onClick={isPaused ? onResume : onPause} className="secondary-action">
+                <Icon name={isPaused ? 'play' : 'pause'} size={17} />{isPaused ? '继续传输' : '暂停'}
+              </button>
+            )}
             <button type="button" onClick={() => setConfirmCancel(true)} className="danger-action">
               <Icon name="close" size={17} />取消传输
             </button>

@@ -1,0 +1,28 @@
+services:
+  coturn:
+    image: coturn/coturn:4.6.3
+    container_name: airdrop-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./certs/fullchain.pem:/etc/coturn/certs/fullchain.pem:ro
+      - ./certs/privkey.pem:/etc/coturn/certs/privkey.pem:ro
+    command:
+      - --no-cli
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET:?TURN_SECRET is required}
+      - --realm=${TURN_REALM:?TURN_REALM is required}
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --min-port=49160
+      - --max-port=49200
+      - --cert=/etc/coturn/certs/fullchain.pem
+      - --pkey=/etc/coturn/certs/privkey.pem
+      - --no-multicast-peers
+      - --no-loopback-peers
+      - --stale-nonce=600
+      - --max-bps=${TURN_MAX_BPS:-5000000}
+      - --total-quota=${TURN_TOTAL_QUOTA:-100}
+      - --user-quota=${TURN_USER_QUOTA:-4}
+      - --log-file=stdout
