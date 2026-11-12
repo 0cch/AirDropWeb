@@ -1,77 +1,188 @@
-# AirDrop Web — P2P 文件传输
+<h1 align="center">AirDrop Web</h1>
 
-外网部署的浏览器文件传输站。用户通过 8 位 Token 配对，WebRTC DataChannel 优先直连，无法直连时可回退到 TURN 加密中继。服务器只负责 HTTP/WSS 信令、WebRTC ICE 配置和房间管理，不保存文件。
+<p align="center">
+  基于 WebRTC 的浏览器文件传输工具。扫码或分享链接配对，文件优先在两台设备间直连；复杂网络下可回退到加密 TURN 中继。
+</p>
 
-## 特性
+<p align="center">
+  <a href="https://github.com/0cch/AirDropWeb/actions/workflows/ci.yml"><img src="https://github.com/0cch/AirDropWeb/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <img src="https://img.shields.io/badge/Node.js-22%2B-339933?logo=node.js&logoColor=white" alt="Node.js 22+" />
+  <img src="https://img.shields.io/badge/React-19-087ea4?logo=react&logoColor=white" alt="React 19" />
+  <img src="https://img.shields.io/badge/WebRTC-DataChannel-333333?logo=webrtc&logoColor=white" alt="WebRTC" />
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" />
+</p>
 
-- WebRTC 端到端加密传输，优先 P2P 直连
-- 分享链接、二维码和系统分享，接收方可直接打开链接加入
-- 接收方可使用应用内摄像头扫码，失败后自动回退到手动输入
-- 多文件队列：一次确认、逐文件传输、总进度与单文件状态
-- 可选 TURN/TURNS 中继，覆盖对称 NAT、企业网络等场景
-- Chromium 浏览器支持 File System Access API 流式落盘，大文件不必全部进入内存
-- 多文件在 Chromium 中可选择一次保存目录，文件按队列顺序写入
-- 其他浏览器自动使用内存模式，默认整批文件总大小上限 256 MB
-- 文件元信息、流控、完成 ACK、错误与取消控制消息
-- 支持暂停/继续、取消确认和单文件失败重试
-- 信令短暂断开后会在恢复窗口内重新绑定原房间
-- DataChannel 断开后自动重新协商，并从接收端最后写入位置续传
-- 显示局域网直连、公网直连或 TURN 中继等实际连接路径
-- 移动端支持屏幕常亮、分享链接和安全区域布局
-- 64 KB 分块、DataChannel 背压与接收端写入信用窗口
-- ICE candidate 排队、连接超时、传输超时与明确错误提示
-- 一次性房间、角色冲突检测、Origin 校验、连接与消息速率限制
-- CSP、安全响应头、异步静态文件服务和长期缓存
-- Node.js 内置测试、TypeScript 检查和 GitHub Actions CI
+---
+
+## 产品预览
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/home.png" width="320" alt="AirDrop Web 首页" /><br />
+      <sub><b>简洁的双入口首页</b><br />发送文件或接收文件，无需注册和安装。</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/share.png" width="320" alt="分享链接与二维码" /><br />
+      <sub><b>链接、Token 和二维码配对</b><br />接收方可直接打开分享链接或扫码加入。</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/queue.png" width="320" alt="多文件传输队列" /><br />
+      <sub><b>一次确认整批文件</b><br />显示文件级状态、总大小和实际连接路径。</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/complete.png" width="320" alt="文件接收完成" /><br />
+      <sub><b>完成摘要与下载</b><br />展示文件数量、总大小、耗时和连接方式。</sub>
+    </td>
+  </tr>
+</table>
+
+## 功能说明
+
+### 1. 简单配对，无需账户
+
+发送方创建会话后会生成分享链接、8 位 Token 和二维码。接收方可以：
+
+- 扫描二维码打开分享链接
+- 直接粘贴 Token 或完整分享链接
+- 在支持摄像头的浏览器中使用应用内扫码
+
+分享链接会自动预填 Token，减少手动输入错误。
+
+### 2. WebRTC 点对点传输
+
+文件通过 WebRTC DataChannel 传输，并使用 DTLS 加密。页面会通过 ICE 统计信息显示实际连接路径：
+
+- 局域网直连
+- 公网 P2P 直连
+- TURN 加密中继
+- 连接失败
+
+信令服务器只交换房间信息和 SDP/ICE，不保存文件内容。
+
+### 3. 多文件队列
+
+- 一次选择最多 100 个文件
+- 接收方一次确认整个队列
+- 按顺序逐个传输
+- 显示总进度、文件进度、速度和 ETA
+- 支持暂停、继续、取消确认和单文件失败重试
+- 同一会话内可继续发送下一批文件
+
+### 4. 大文件与流式落盘
+
+Chromium 浏览器支持 File System Access API：
+
+- 单文件直接写入用户选择的位置
+- 多文件可一次选择保存目录
+- 文件不会完整驻留在页面内存中
+
+Firefox、Safari 等不支持文件句柄的浏览器会自动使用内存模式，整批文件总大小上限为 256 MB。
+
+### 5. 连接恢复与断点续传
+
+- WebSocket 短暂断开后，默认保留房间 45 秒
+- 客户端自动重连并恢复原角色
+- DataChannel/ICE 失败后自动重新协商
+- 接收端报告已写入偏移，发送端从该位置继续
+- 恢复期间显示“正在恢复连接”
+- 恢复完成后按字节数校验文件完整性
+
+当前断点续传覆盖同一页面会话内的连接恢复；页面刷新后的持久化恢复属于后续阶段。
+
+### 6. 移动端与可访问性
+
+- 响应式布局和安全区域适配
+- 传输期间请求 Screen Wake Lock
+- 统一 SVG 图标，减少不同系统 Emoji 差异
+- 进度条、错误提示和状态变化提供 ARIA 信息
+- 支持系统减少动画设置
+
+## 架构
+
+```text
+┌──────────────┐                  ┌────────────────────┐                  ┌──────────────┐
+│  发送方浏览器 │ ←── WSS 信令 ──→ │ Node.js 信令服务器 │ ←── WSS 信令 ──→ │ 接收方浏览器 │
+└──────┬───────┘                  └────────────────────┘                  └──────┬───────┘
+       │                                                                          │
+       └──────────────── WebRTC DataChannel（优先直连）────────────────────────────┘
+                                      │
+                         直连失败时回退到 TURN 中继
+```
+
+服务器负责：
+
+- Token 房间与角色管理
+- WebSocket 心跳、恢复窗口与速率限制
+- SDP/ICE 信令转发
+- STUN/TURN ICE 配置下发
+- 静态前端文件与健康检查
+
+服务器不接收文件内容。
 
 ## 快速开始
 
 要求 Node.js 22 或更高版本。
 
 ```bash
+git clone https://github.com/0cch/AirDropWeb.git
+cd AirDropWeb
 npm ci
 npm run dev
 ```
 
-浏览器打开 <http://localhost:5174>。Vite 会将 `/ws` 和 `/api` 代理到 `http://localhost:8080`。
+打开 <http://127.0.0.1:5174>。Vite 会将 `/ws` 和 `/api` 代理到本地 `8080` 端口。
 
 常用命令：
 
 ```bash
-npm run typecheck   # TypeScript 检查
-npm test            # 信令服务回归测试
-npm run build       # 构建前端
-npm run audit:prod  # 检查生产依赖漏洞
-npm start           # 启动生产信令服务
+npm run dev              # 启动信令服务器和前端
+npm run typecheck        # TypeScript 检查
+npm test                 # 前端协议测试 + 服务端回归测试
+npm run test:e2e         # Playwright 跨浏览器 E2E
+npm run test:e2e:chromium
+npm run build            # 生产构建
+npm run audit:prod       # 生产依赖审计
+npm start                # 启动生产信令服务器
 ```
 
-## 使用流程
+首次运行 Playwright：
 
-1. 发送方点击“发送文件”，获得 Token、分享链接和二维码
-2. 接收方扫描二维码、打开分享链接，或手动输入 Token
-3. 配对后，发送方可以一次选择多个文件
-4. 接收方确认整个队列并选择保存位置或目录
-5. 文件按顺序传输，支持暂停、继续和单文件失败重试
-6. 全部文件完成并校验后，发送方才会显示“对方已确认接收完成”
+```bash
+npx playwright install chromium firefox webkit
+```
 
 ## 公网部署
 
+推荐使用 Nginx + HTTPS：
+
 ```bash
 chmod +x deploy.sh
-DOMAIN=example.com USE_NGINX=yes USE_HTTPS=yes ./deploy.sh
+
+DOMAIN=example.com \
+USE_NGINX=yes \
+USE_HTTPS=yes \
+./deploy.sh
 ```
 
-直接以 Node.js 对外提供服务：
+部署脚本会：
 
-```bash
-PORT=8080 ./deploy.sh
-```
+- 检查并安装 Node.js 22+
+- 安装 workspace 依赖并构建前端
+- 配置防火墙
+- 可选配置 Nginx、HTTPS 和 WSS
+- 创建 systemd 服务
+- 应用 systemd 权限收紧配置
 
-部署脚本会安装 Node.js 22+、安装 workspace 依赖、构建前端、配置防火墙和 systemd。Nginx 模式下应用默认只监听 `127.0.0.1`，服务器只需暴露 80/443，不会额外公开内部 8080 端口。
+Nginx 模式下应用默认只监听 `127.0.0.1`，只需公开 80/443。
 
-### 可选 TURN 配置
+## TURN 配置
 
-生产环境建议部署 coturn，并使用短期 HMAC 凭据。服务端支持 coturn REST API 风格的动态凭据：
+公网生产环境建议部署自己的 coturn。仓库提供可直接复用的 [coturn Docker Compose 模板](deploy/coturn/README.md)。
+
+使用短期 HMAC 凭据：
 
 ```bash
 TURN_URLS="turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp" \
@@ -80,105 +191,95 @@ TURN_REQUIRED=1 \
 DOMAIN=example.com USE_NGINX=yes USE_HTTPS=yes ./deploy.sh
 ```
 
-可直接复用的 coturn Docker Compose 模板位于 `deploy/coturn/`。
+详细步骤见 [deploy/coturn/README.md](deploy/coturn/README.md)。
 
-对应的 coturn 配置示例：
-
-```conf
-use-auth-secret
-static-auth-secret=replace-with-a-long-random-secret
-realm=turn.example.com
-listening-port=3478
-tls-listening-port=5349
-min-port=49160
-max-port=49200
-fingerprint
-no-multicast-peers
-```
-
-同时在防火墙中仅开放 coturn 实际使用的端口。TURN 会产生服务器带宽成本，公开服务应增加带宽配额与监控。
-
-也可以使用固定凭据，但只建议内网测试：
-
-```bash
-TURN_URLS="turn:turn.example.com:3478" \
-TURN_USERNAME="airdrop" \
-TURN_CREDENTIAL="strong-password" \
-./deploy.sh
-```
-
-## 服务端环境变量
+主要环境变量：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8080` | HTTP/WSS 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址；Nginx 模式建议 `127.0.0.1` |
-| `NODE_ENV` | 未设置 | 生产环境设为 `production`，启用严格 Origin 规则 |
-| `ALLOWED_ORIGINS` | 同源 | 逗号分隔的额外允许 Origin |
-| `TRUST_PROXY` | `0` | 位于可信反向代理后时设为 `1` |
+| `ALLOWED_ORIGINS` | 同源 | 额外允许的 WebSocket Origin，逗号分隔 |
 | `ROOM_TTL_MS` | `600000` | 未配对房间有效期 |
-| `ROOM_RESUME_GRACE_MS` | `45000` | WebSocket 断开后的房间恢复窗口 |
+| `ROOM_RESUME_GRACE_MS` | `45000` | WebSocket 断开后的恢复窗口 |
 | `MAX_ROOMS` | `500` | 全局房间上限 |
 | `MAX_CLIENTS` | `1000` | WebSocket 连接上限 |
-| `MAX_CONNECTIONS_PER_MINUTE` | `60` | 单 IP 每分钟建连上限 |
-| `MAX_CONCURRENT_CONNECTIONS_PER_IP` | `20` | 单 IP 并发 WebSocket 上限 |
-| `MESSAGE_RATE_PER_SECOND` | `40` | 单连接消息速率 |
-| `MAX_SIGNAL_BYTES` | `262144` | 单条信令消息大小上限 |
 | `STUN_URLS` | 内置公共 STUN | 逗号分隔的 STUN 地址 |
 | `TURN_URLS` | 空 | 逗号分隔的 TURN/TURNS 地址 |
-| `TURN_SECRET` | 空 | 生成短期 TURN 凭据的共享密钥 |
+| `TURN_SECRET` | 空 | 短期 TURN 凭据共享密钥 |
 | `TURN_TTL_SECONDS` | `3600` | 短期 TURN 凭据有效期 |
-| `TURN_REQUIRED` | `0` | 设为 `1` 时，TURN 配置无效将拒绝启动 |
-| `TURN_USERNAME` / `TURN_CREDENTIAL` | 空 | 固定 TURN 凭据，仅建议测试 |
+| `TURN_REQUIRED` | `0` | 为 `1` 时 TURN 配置无效会拒绝启动 |
 
-`/api/ice-config` 会向浏览器返回 STUN/TURN 配置，TURN 动态用户名和密码不会写死在静态构建产物中。
+`/api/ice-config` 会向浏览器下发 STUN/TURN 配置；短期 TURN 密码不会写入静态构建产物。
 
-## 传输限制
+## 测试
 
-- 流式落盘依赖 File System Access API，目前主要支持 Chromium 桌面浏览器
-- Firefox、Safari 或不支持文件选择器的环境使用内存模式，整批文件总大小上限 256 MB
-- 多文件目录落盘依赖 File System Access API，目前主要支持 Chromium 桌面浏览器
-- 接收端必须在应用内点击“选择位置并接收”，这是浏览器要求用户手势才能打开文件保存选择器的安全限制
-- 文件队列最多 100 个文件；单个会话内的批次会按顺序传输
-- 纯 P2P 无法覆盖所有 NAT 组合，生产环境应配置 TURN
-
-## 自动化测试
-
-项目包含 Vitest、Node.js 回归测试和 Playwright 跨浏览器端到端测试：
+### 单元与回归测试
 
 ```bash
 npm test
+```
+
+覆盖：
+
+- 传输控制消息和文件队列协议
+- 文件名校验与分享链接 Token 提取
+- 恶意 WebSocket/HTTP 输入
+- 信令房间恢复
+- TURN 配置校验和短期凭据生成
+
+### Playwright E2E
+
+```bash
 npm run test:e2e
-npm run test:e2e:chromium
 ```
 
-首次运行 Playwright 前执行 `npx playwright install chromium firefox webkit`。
+覆盖 Chromium、Firefox 和 WebKit 的基础传输，并在 Chromium 中执行：
 
-Playwright 覆盖多文件传输、目录落盘、磁盘错误重试、信令恢复、DataChannel 恢复、扫码权限降级和分享链接预填。
+- 多文件内存模式传输
+- 多文件目录流式落盘
+- 模拟磁盘写入失败
+- 信令 WebSocket 断开恢复
+- DataChannel 断开后的断点续传
+- 恢复后文件字节完整性
+- 摄像头权限失败与手动输入降级
 
-## 安全设计
+GitHub Actions 会执行 Node.js 22/24 构建矩阵和跨浏览器 E2E。
 
-- Token 使用 Node.js `crypto.randomInt()` 生成
-- 房间每个角色最多一个连接，一个 WebSocket 只能加入一个房间
-- 生产环境校验 WebSocket Origin；可配置允许来源
-- 限制单 IP 建连、单连接消息速率、全局连接数和房间数
-- 信令消息执行结构和大小校验，HTTP URL 解码与静态路径错误不会导致进程退出
-- 静态路径通过 `path.relative()` 校验，防止目录穿越
-- 默认启用 CSP、`X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy` 等响应头
-- WebRTC DataChannel 使用 DTLS 加密；Token 仍应通过可信渠道分享
+## 安全与隐私
 
-## 架构
+- Token 使用 `crypto.randomInt()` 生成
+- 每个角色使用独立不可猜测的 `sessionId` 恢复会话
+- WebSocket Origin、连接数、房间数和消息速率限制
+- 信令消息执行结构、类型和大小校验
+- 静态路径防目录穿越
+- CSP、`X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy`
+- 文件内容不经过信令服务器
+- 使用 TURN 时，文件仍由 DTLS 加密，但会经过 TURN 服务器带宽
+- 摄像头画面只在本地用于二维码识别，不上传服务器
 
-```text
-发送方浏览器 ── WSS 信令 ──┐
-                           ├── Node.js 信令服务器
-接收方浏览器 ── WSS 信令 ──┘
-      │
-      └── WebRTC DataChannel：优先直连，必要时经 TURN 中继
-```
+## 浏览器支持
 
-信令服务器不接收文件内容。配置 TURN 时，只有在 WebRTC 直连失败后，加密后的文件流量才会经过 TURN 服务器。
+| 浏览器 | P2P 传输 | 断点续传 | 流式落盘 | 应用内扫码 |
+| --- | --- | --- | --- | --- |
+| Chrome / Edge | ✅ | ✅ | ✅ | ✅ |
+| Firefox | ✅ | ✅ | 内存模式 | 依赖摄像头与安全上下文 |
+| Safari | ✅ | ✅ | 内存模式 | 依赖摄像头与安全上下文 |
+
+公共 STUN 可以协助 NAT 穿透，但无法覆盖所有网络。对称 NAT、企业防火墙或 UDP 被限制时，需要配置 TURN。
+
+## 技术栈
+
+- React 19 + TypeScript
+- Vite 8
+- Tailwind CSS
+- WebRTC DataChannel
+- Node.js + `ws`
+- coturn
+- Vitest + Node.js Test Runner
+- Playwright
+- GitHub Actions
 
 ## License
 
-MIT
+[MIT](LICENSE)
